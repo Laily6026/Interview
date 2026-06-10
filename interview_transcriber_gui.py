@@ -156,18 +156,20 @@ class TranscriberApp:
         self.status_var = tk.StringVar(value="대기 중")
         ttk.Label(frame_run, textvariable=self.status_var).pack(side="left")
 
+        # 하단 버튼 (로그 창보다 먼저 bottom에 고정 → 창이 작아도 항상 표시됨)
+        frame_bottom = ttk.Frame(self.root)
+        frame_bottom.pack(side="bottom", fill="x", padx=10, pady=(0, 10))
+        ttk.Button(frame_bottom, text="결과 폴더 열기", command=self.open_output_folder).pack(side="left")
+        ttk.Button(frame_bottom, text="전사문(.txt) 열기", command=self.open_txt).pack(side="left", padx=6)
+        ttk.Label(frame_bottom, text="결과물은 녹음 파일과 같은 폴더에 저장됩니다."
+                  ).pack(side="right")
+
         # 결과/로그 영역
         frame_log = ttk.LabelFrame(self.root, text="3. 진행 상황 및 결과 미리보기")
         frame_log.pack(fill="both", expand=True, **pad)
         self.log_box = scrolledtext.ScrolledText(frame_log, wrap="word", state="disabled",
                                                  font=("Malgun Gothic", 10))
         self.log_box.pack(fill="both", expand=True, padx=8, pady=8)
-
-        # 하단 버튼
-        frame_bottom = ttk.Frame(self.root)
-        frame_bottom.pack(fill="x", padx=10, pady=(0, 10))
-        ttk.Button(frame_bottom, text="결과 폴더 열기", command=self.open_output_folder).pack(side="left")
-        ttk.Button(frame_bottom, text="전사문(.txt) 열기", command=self.open_txt).pack(side="left", padx=6)
 
     # ---------------- 파일 선택 ----------------
     def select_files(self):
@@ -252,7 +254,10 @@ class TranscriberApp:
             for audio_path in list(self.files):
                 self._transcribe_one(audio_path, prompt, with_ts, make_srt)
 
-            self.log("\n■ 모든 작업이 끝났습니다. [결과 폴더 열기] 버튼으로 확인하세요.")
+            self.log("\n■ 모든 작업이 끝났습니다.")
+            if self.last_output_dir:
+                self.log(f"■ 결과 저장 위치: {self.last_output_dir}")
+            self.log("■ 하단의 [결과 폴더 열기] / [전사문(.txt) 열기] 버튼으로 확인하세요.")
         except Exception as e:
             self.log(f"✘ 오류 발생: {e}")
         finally:
