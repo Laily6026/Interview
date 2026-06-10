@@ -1,0 +1,32 @@
+# PyInstaller 빌드 산출물 (용량 커서 저장소에 올리지 않음 → Releases로 배포)
+build/
+dist/
+*.spec
+
+# Python 캐시
+__pycache__/
+*.pyc
+
+# 가상환경
+venv/
+.venv/
+
+# 전사 결과물 (발명 내용 보안상 절대 커밋 금지)
+*_전사.txt
+*_자막.srt
+*_정리초안.md
+
+# 음성/영상 파일 (보안 + 용량)
+*.mp3
+*.wav
+*.m4a
+*.mp4
+*.ogg
+*.flac
+*.wma
+*.aac
+*.webm
+*.opus
+*.mkv
+*.avi
+*.mov
