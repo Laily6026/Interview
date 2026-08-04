@@ -1,49 +1,81 @@
 # 발명자 인터뷰 전사기
 
-발명자 인터뷰 녹음(mp3, m4a, mp4 등)을 텍스트로 변환하는 프로그램입니다.
-faster-whisper 기반으로 **모든 처리가 로컬 PC에서 이루어지므로**
-음성 파일이 외부 서버로 전송되지 않습니다.
+발명자 인터뷰 녹음·영상(mp3, m4a, mp4 등)을 한국어 텍스트로 변환하는 로컬 프로그램입니다.
+`faster-whisper`를 사용하며 음성 파일은 외부 서버로 전송되지 않습니다.
 
-## 일반 사용자: .exe로 사용 (권장)
+## 이번 버전에서 달라진 점
 
-1. 이 저장소의 **[Releases](../../releases)** 페이지에서 최신 `인터뷰전사기.exe` 다운로드
-2. 더블클릭 실행 (최초 실행은 압축 해제로 10~30초 걸릴 수 있음)
-3. 음성 파일 선택 → 옵션 설정 → [▶ 전사 시작]
-4. 결과는 음성 파일과 같은 폴더에 생성됩니다:
-   - `파일명_전사.txt` — 타임스탬프 포함 전사문
-   - `파일명_자막.srt` — 녹음 재생 대조용 자막
-   - `파일명_정리초안.md` — 인터뷰 정리 템플릿(전문 포함)
+- 기본 전사 모드를 **누락 최소화**로 변경했습니다. 민감한 VAD와 넓은 음성 여백으로 작은 목소리를 더 많이 보존합니다.
+- `initial_prompt`와 `hotwords`에 기술용어 힌트를 함께 전달합니다.
+- 15초 이상 전사가 비어 있는 구간을 `*_전사_검토구간.md`에 기록합니다.
+- 소스와 결과물의 깨진 한글을 바로잡고 결과를 UTF-8 BOM으로 저장합니다.
+- README에만 적혀 있고 누락되어 있던 CLI(`interview_transcriber.py`)를 추가했습니다.
+- 세그먼트의 단어 타임스탬프를 사용해 검토 위치와 SRT 경계를 더 정확히 잡습니다.
 
-> 최초 1회 모델 다운로드를 위해 인터넷 연결이 필요합니다.
-> (medium 약 1.5GB / large-v3 약 3GB, `C:\Users\사용자명\.cache\huggingface`에 저장)
-> 다운로드 후에는 오프라인에서 동작합니다.
+## 전사 모드
 
-## 개발자: 소스로 실행
+| 모드 | 동작 | 권장 상황 |
+|---|---|---|
+| 누락 최소화 (기본) | 민감한 VAD와 앞뒤 1초 여백 사용 | 회의·인터뷰, 작은 목소리, 누락이 문제인 경우 |
+| 균형 | 낮은 임계값과 넉넉한 여백으로 VAD 사용 | 무음이 매우 긴 녹음 |
+| 빠르게 | 명확한 음성만 선별 | 깨끗한 단일 화자 녹음, 초벌 확인 |
 
-```cmd
-pip install -r requirements.txt
+VAD는 음성 구간 감지(Voice Activity Detection)입니다. 임계값이 너무 높으면 작은 음성이 모델에 전달되기 전에 빠지고, 완전히 끄면 긴 무음에서 반복 문장이 생길 수 있습니다. 기본 모드는 이 영상으로 확인한 낮은 임계값과 넓은 여백을 사용합니다.
+
+## GUI로 실행
+
+```powershell
+python -m pip install -r requirements.txt
 python interview_transcriber_gui.py
 ```
 
-CLI 버전:
+1. 파일 또는 폴더를 선택합니다.
+2. 정확도가 중요하면 `large-v3`와 `누락 최소화 (권장)`를 사용합니다.
+3. 사건별 기술용어·고유명사를 힌트 입력란에 추가합니다.
+4. 전사가 끝나면 전사문과 함께 검토 구간 파일을 확인합니다.
 
-```cmd
-python interview_transcriber.py 녹음파일.m4a --model large-v3
+결과는 원본과 같은 폴더에 생성됩니다.
+
+- `파일명_전사.txt`: 타임스탬프 포함 전사문
+- `파일명_자막.srt`: 원본 대조용 자막
+- `파일명_정리초안.md`: 정리 템플릿과 전체 전사문
+- `파일명_전사_검토구간.md`: 장시간 공백 청취 검토 목록
+
+## CLI로 실행
+
+```powershell
+python interview_transcriber.py "녹음파일.mp4" --model large-v3 --mode high_recall
 ```
 
-## .exe 빌드 방법
+주요 옵션:
 
-```cmd
-pip install -r requirements.txt
-python -m PyInstaller --onefile --noconsole --name "인터뷰전사기" --collect-all faster_whisper interview_transcriber_gui.py
+```text
+--mode high_recall|balanced|fast
+--prompt "고유명사, 기술용어, 약어"
+--gap-seconds 15
+--output-dir "결과폴더"
+--no-timestamps
+--no-srt
 ```
 
-→ `dist\인터뷰전사기.exe` 생성. 새 버전은 Releases에 업로드하여 배포합니다.
+## `.exe` 빌드
 
-## 사용 팁
+```powershell
+python -m pip install -r requirements.txt
+python -m PyInstaller --onefile --noconsole --name "인터뷰전사기" `
+  --collect-all faster_whisper `
+  interview_transcriber_gui.py
+```
 
-- **기술용어 힌트**: 사건별 핵심 용어(예: "리튬이차전지, 양극활물질")를
-  힌트 입력란에 추가하면 전문용어 인식률이 올라갑니다.
-- **모델 선택**: medium = 속도·정확도 균형 / large-v3 = 최고 정확도(느림)
-- **보안 주의**: 전사 결과물(txt/srt/md)은 발명 내용이 포함되므로
-  저장소에 커밋하지 마세요 (.gitignore로 차단되어 있음).
+최초 실행 시 선택한 모델을 내려받기 위해 인터넷 연결이 필요합니다. 모델 다운로드 후에는 오프라인으로 동작합니다.
+
+## 정확도를 높이는 팁
+
+- `large-v3`만 선택하는 것보다 전사 모드가 중요합니다. 누락이 걱정되면 `누락 최소화`를 사용하세요.
+- 기술용어 힌트에는 문장보다 실제 발화에 나오는 표기와 약어를 쉼표로 넣는 편이 좋습니다.
+- 검토 구간 목록은 자동 오류 판정이 아닙니다. 실제 무음일 수도 있으므로 원본을 들어 확인하세요.
+- 겹쳐 말한 부분, 매우 작은 원격 화자, 잘린 마이크 음성은 모델만 바꿔도 완전히 복원되지 않을 수 있습니다.
+
+## 보안 주의
+
+전사 결과에는 공개 전 발명 내용이 포함될 수 있습니다. 오디오와 결과물은 `.gitignore`로 차단되어 있으므로 저장소에 강제로 커밋하지 마세요.
