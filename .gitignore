@@ -2,6 +2,7 @@
 build/
 dist/
 *.spec
+!인터뷰전사기.spec
 
 # Python 캐시와 가상환경
 __pycache__/

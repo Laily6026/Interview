@@ -15,17 +15,14 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 from typing import Iterable
 
-from transcriber_core import PROFILES, TranscriberEngine, format_timestamp
+from transcriber_core import APP_VERSION, PROFILES, TranscriberEngine, format_timestamp
 
 
 AUDIO_EXTENSIONS = {
     ".mp3", ".wav", ".m4a", ".mp4", ".ogg", ".flac",
     ".wma", ".aac", ".webm", ".opus", ".mkv", ".avi", ".mov",
 }
-DEFAULT_PROMPT = (
-    "발명자 인터뷰 녹취록입니다. 특허, 출원, 청구항, 명세서, 실시예, "
-    "선행기술, 종래기술, 발명의 효과, 구성요소 등의 용어가 사용됩니다."
-)
+DEFAULT_HOTWORDS = "특허, 출원, 청구항, 명세서, 실시예, 선행기술, 종래기술, 발명의 효과, 구성요소"
 MODEL_CHOICES = ["tiny", "base", "small", "medium", "large-v2", "large-v3"]
 PROFILE_LABEL_TO_KEY = {profile.label: key for key, profile in PROFILES.items()}
 
@@ -33,9 +30,9 @@ PROFILE_LABEL_TO_KEY = {profile.label: key for key, profile in PROFILES.items()}
 class TranscriberApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("발명자 인터뷰 전사기 — 로컬 처리")
-        self.root.geometry("820x720")
-        self.root.minsize(720, 620)
+        self.root.title(f"발명자 인터뷰 전사기 v{APP_VERSION} — 로컬 처리")
+        self.root.geometry("840x800")
+        self.root.minsize(740, 680)
 
         self.files: list[Path] = []
         self.engine = TranscriberEngine()
@@ -101,21 +98,45 @@ class TranscriberApp:
         second_row.pack(fill="x", padx=8, pady=4)
         self.timestamps_var = tk.BooleanVar(value=True)
         self.srt_var = tk.BooleanVar(value=True)
+        self.auto_retry_var = tk.BooleanVar(value=True)
+        self.normalize_retry_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(second_row, text="TXT에 타임스탬프 포함", variable=self.timestamps_var).pack(side="left")
         ttk.Checkbutton(second_row, text="자막(.srt) 생성", variable=self.srt_var).pack(side="left", padx=12)
         ttk.Label(second_row, text="검토 공백 기준(초):").pack(side="left", padx=(12, 4))
         self.gap_seconds_var = tk.StringVar(value="15")
         ttk.Entry(second_row, textvariable=self.gap_seconds_var, width=6).pack(side="left")
 
+        retry_row = ttk.Frame(option_frame)
+        retry_row.pack(fill="x", padx=8, pady=4)
+        ttk.Checkbutton(
+            retry_row,
+            text="이상 구간 자동 재전사 (권장)",
+            variable=self.auto_retry_var,
+        ).pack(side="left")
+        ttk.Checkbutton(
+            retry_row,
+            text="재전사 시 저음량 보정",
+            variable=self.normalize_retry_var,
+        ).pack(side="left", padx=12)
+
+        hotword_row = ttk.Frame(option_frame)
+        hotword_row.pack(fill="x", padx=8, pady=(4, 4))
+        ttk.Label(
+            hotword_row,
+            text="기술용어 (hotwords, 문장이 아닌 고유명사·전문용어를 쉼표로 구분):",
+        ).pack(anchor="w")
+        self.hotwords_entry = tk.Text(hotword_row, height=2, wrap="word")
+        self.hotwords_entry.insert("1.0", DEFAULT_HOTWORDS)
+        self.hotwords_entry.pack(fill="x", pady=(2, 0))
+
         prompt_row = ttk.Frame(option_frame)
         prompt_row.pack(fill="x", padx=8, pady=(4, 8))
         ttk.Label(
             prompt_row,
-            text="기술용어 힌트 (사건별 고유명사·전문용어를 쉼표로 추가):",
+            text="배경 설명 (initial prompt, 필요한 경우에만 입력):",
         ).pack(anchor="w")
-        self.prompt_entry = tk.Text(prompt_row, height=3, wrap="word")
-        self.prompt_entry.insert("1.0", DEFAULT_PROMPT)
-        self.prompt_entry.pack(fill="x", pady=(2, 0))
+        self.initial_prompt_entry = tk.Text(prompt_row, height=2, wrap="word")
+        self.initial_prompt_entry.pack(fill="x", pady=(2, 0))
 
         run_frame = ttk.Frame(self.root)
         run_frame.pack(fill="x", **pad)
@@ -226,7 +247,10 @@ class TranscriberApp:
             gap_seconds,
             self.model_var.get(),
             PROFILE_LABEL_TO_KEY.get(self.profile_var.get(), "high_recall"),
-            self.prompt_entry.get("1.0", "end").strip() or None,
+            self.initial_prompt_entry.get("1.0", "end").strip() or None,
+            self.hotwords_entry.get("1.0", "end").strip() or None,
+            self.auto_retry_var.get(),
+            self.normalize_retry_var.get(),
             self.timestamps_var.get(),
             self.srt_var.get(),
             list(self.files),
@@ -238,7 +262,10 @@ class TranscriberApp:
         gap_seconds: float,
         model_name: str,
         profile_key: str,
-        prompt: str | None,
+        initial_prompt: str | None,
+        hotwords: str | None,
+        auto_retry: bool,
+        normalize_retry_audio: bool,
         include_timestamps: bool,
         make_srt: bool,
         files: list[Path],
@@ -248,13 +275,17 @@ class TranscriberApp:
 
             self._queue_log(f"모델: {model_name}")
             self._queue_log(f"전사 모드: {PROFILES[profile_key].label}")
+            self._queue_log(f"이상 구간 자동 재전사: {'사용' if auto_retry else '사용 안 함'}")
             for file_index, audio_path in enumerate(files, start=1):
                 self._queue_log(f"\n[{file_index}/{len(files)}] 전사 시작: {audio_path.name}")
                 result = self.engine.transcribe(
                     audio_path,
                     model_name=model_name,
                     profile_key=profile_key,
-                    prompt=prompt,
+                    initial_prompt=initial_prompt,
+                    hotwords=hotwords,
+                    auto_retry=auto_retry,
+                    normalize_retry_audio=normalize_retry_audio,
                     gap_seconds=gap_seconds,
                     include_timestamps=include_timestamps,
                     make_srt=make_srt,
@@ -265,7 +296,8 @@ class TranscriberApp:
                 self.last_review_path = result.review_path
                 self._queue_log(
                     f"완료: {len(result.segments)}개 세그먼트, "
-                    f"검토 후보 {len(result.gaps)}개"
+                    f"자동 재전사 {sum(item.accepted for item in result.retry_attempts)}개 채택, "
+                    f"남은 검토 공백 {len(result.gaps)}개"
                 )
                 self._queue_log(f"전사문: {result.txt_path.name}")
                 self._queue_log(f"검토 구간: {result.review_path.name}")

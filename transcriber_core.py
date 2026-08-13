@@ -5,12 +5,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import timedelta
+from difflib import SequenceMatcher
 from pathlib import Path
+import re
 from typing import Callable, Iterable, Optional
 
 
 ProgressCallback = Callable[[float, str], None]
+APP_VERSION = "1.2"
 
 
 @dataclass(frozen=True)
@@ -36,8 +38,8 @@ PROFILES = {
             },
             "no_speech_threshold": 0.7,
             "log_prob_threshold": -1.1,
-            "condition_on_previous_text": True,
-            "hallucination_silence_threshold": 2.0,
+            "condition_on_previous_text": False,
+            "hallucination_silence_threshold": 1.5,
         },
     ),
     "balanced": TranscriptionProfile(
@@ -54,7 +56,7 @@ PROFILES = {
             },
             "no_speech_threshold": 0.7,
             "log_prob_threshold": -1.1,
-            "condition_on_previous_text": True,
+            "condition_on_previous_text": False,
         },
     ),
     "fast": TranscriptionProfile(
@@ -71,7 +73,7 @@ PROFILES = {
             },
             "no_speech_threshold": 0.6,
             "log_prob_threshold": -1.0,
-            "condition_on_previous_text": True,
+            "condition_on_previous_text": False,
         },
     ),
 }
@@ -84,6 +86,29 @@ class SegmentRecord:
     text: str
     avg_logprob: float = 0.0
     no_speech_prob: float = 0.0
+    compression_ratio: float = 0.0
+    audio_rms_db: Optional[float] = None
+    voiced_fraction: Optional[float] = None
+
+
+@dataclass
+class QualityIssue:
+    start: float
+    end: float
+    kind: str
+    reason: str
+    text: str = ""
+
+
+@dataclass
+class RetryAttempt:
+    start: float
+    end: float
+    reasons: list[str] = field(default_factory=list)
+    replace_existing: bool = False
+    candidate_count: int = 0
+    accepted: bool = False
+    note: str = ""
 
 
 @dataclass
@@ -107,6 +132,8 @@ class TranscriptionResult:
     profile_key: str
     segments: list[SegmentRecord] = field(default_factory=list)
     gaps: list[ReviewGap] = field(default_factory=list)
+    quality_issues: list[QualityIssue] = field(default_factory=list)
+    retry_attempts: list[RetryAttempt] = field(default_factory=list)
     txt_path: Optional[Path] = None
     srt_path: Optional[Path] = None
     md_path: Optional[Path] = None
@@ -166,6 +193,372 @@ def find_review_gaps(
     return gaps
 
 
+def normalize_hotwords(hotwords: Optional[str]) -> Optional[str]:
+    """쉼표·줄바꿈으로 입력한 용어를 faster-whisper용 목록으로 정리한다."""
+    if not hotwords:
+        return None
+    terms = [term.strip() for term in re.split(r"[,;\n]+", hotwords) if term.strip()]
+    return ", ".join(dict.fromkeys(terms)) or None
+
+
+def _normalized_text(text: str) -> str:
+    return re.sub(r"[^0-9a-z가-힣]+", "", text.lower())
+
+
+def _text_similarity(left: str, right: str) -> float:
+    left_normalized = _normalized_text(left)
+    right_normalized = _normalized_text(right)
+    if not left_normalized or not right_normalized:
+        return 0.0
+    return SequenceMatcher(None, left_normalized, right_normalized).ratio()
+
+
+def find_quality_issues(
+    segments: Iterable[SegmentRecord],
+    *,
+    prompt_texts: Iterable[str] = (),
+    maximum_segment_seconds: float = 30.0,
+    short_fragment_length: int = 2,
+    short_fragment_count: int = 5,
+    short_fragment_window_seconds: float = 30.0,
+) -> list[QualityIssue]:
+    """긴 압축 세그먼트, 프롬프트 복사, 반복과 짧은 파편 연속을 찾는다."""
+    ordered = sorted(segments, key=lambda item: (item.start, item.end))
+    prompts = [text for text in prompt_texts if text and len(_normalized_text(text)) >= 8]
+    issues: list[QualityIssue] = []
+
+    for segment in ordered:
+        duration = max(0.001, segment.end - segment.start)
+        density = len(_normalized_text(segment.text)) / duration
+        if duration > maximum_segment_seconds:
+            issues.append(
+                QualityIssue(
+                    segment.start,
+                    segment.end,
+                    "long_segment",
+                    f"단일 세그먼트가 {duration:.1f}초로 너무 깁니다.",
+                    segment.text,
+                )
+            )
+        elif duration >= 20.0 and density < 0.5:
+            issues.append(
+                QualityIssue(
+                    segment.start,
+                    segment.end,
+                    "sparse_segment",
+                    f"텍스트 밀도가 {density:.2f}자/초로 낮습니다.",
+                    segment.text,
+                )
+            )
+
+        for prompt in prompts:
+            if _text_similarity(segment.text, prompt) >= 0.85:
+                issues.append(
+                    QualityIssue(
+                        segment.start,
+                        segment.end,
+                        "prompt_echo",
+                        "입력 프롬프트와 거의 같은 문장이 출력되었습니다.",
+                        segment.text,
+                    )
+                )
+                break
+
+    repeated_start = 0
+    while repeated_start < len(ordered):
+        normalized = _normalized_text(ordered[repeated_start].text)
+        if len(normalized) < 8:
+            repeated_start += 1
+            continue
+        repeated_end = repeated_start + 1
+        while (
+            repeated_end < len(ordered)
+            and _text_similarity(ordered[repeated_end].text, ordered[repeated_start].text) >= 0.96
+        ):
+            repeated_end += 1
+        if repeated_end - repeated_start >= 2:
+            issues.append(
+                QualityIssue(
+                    ordered[repeated_start].start,
+                    ordered[repeated_end - 1].end,
+                    "repeated_text",
+                    f"유사 문장이 {repeated_end - repeated_start}회 연속 반복되었습니다.",
+                    ordered[repeated_start].text,
+                )
+            )
+        repeated_start = repeated_end
+
+    short_indices = [
+        index
+        for index, segment in enumerate(ordered)
+        if len(_normalized_text(segment.text)) <= short_fragment_length
+    ]
+    cursor = 0
+    while cursor < len(short_indices):
+        start_index = short_indices[cursor]
+        last_cursor = cursor
+        while (
+            last_cursor + 1 < len(short_indices)
+            and ordered[short_indices[last_cursor + 1]].start - ordered[start_index].start
+            <= short_fragment_window_seconds
+        ):
+            last_cursor += 1
+        if last_cursor - cursor + 1 >= short_fragment_count:
+            end_index = short_indices[last_cursor]
+            issues.append(
+                QualityIssue(
+                    ordered[start_index].start,
+                    ordered[end_index].end,
+                    "short_fragment_streak",
+                    f"{short_fragment_window_seconds:.0f}초 안에 {last_cursor - cursor + 1}개의 짧은 파편이 연속되었습니다.",
+                )
+            )
+            cursor = last_cursor + 1
+        else:
+            cursor += 1
+
+    return sorted(issues, key=lambda item: (item.start, item.end, item.kind))
+
+
+def build_retry_attempts(
+    issues: Iterable[QualityIssue],
+    gaps: Iterable[ReviewGap],
+    *,
+    duration: float,
+    retry_gaps: bool = True,
+    padding_seconds: float = 3.0,
+    maximum_gap_retry_seconds: float = 180.0,
+) -> list[RetryAttempt]:
+    """서로 가까운 품질 문제를 합쳐 재전사할 시간 범위를 만든다."""
+    candidates: list[RetryAttempt] = []
+    for issue in issues:
+        candidates.append(
+            RetryAttempt(
+                start=max(0.0, issue.start - padding_seconds),
+                end=min(duration, issue.end + padding_seconds),
+                reasons=[issue.reason],
+                replace_existing=True,
+            )
+        )
+    if retry_gaps:
+        for gap in gaps:
+            if gap.duration <= maximum_gap_retry_seconds:
+                candidates.append(
+                    RetryAttempt(
+                        start=max(0.0, gap.start - padding_seconds),
+                        end=min(duration, gap.end + padding_seconds),
+                        reasons=[f"{gap.duration:.1f}초 전사 공백"],
+                        replace_existing=False,
+                    )
+                )
+
+    candidates.sort(key=lambda item: (item.start, item.end))
+    merged: list[RetryAttempt] = []
+    for candidate in candidates:
+        if merged and candidate.start <= merged[-1].end + 1.0:
+            current = merged[-1]
+            current.end = max(current.end, candidate.end)
+            current.reasons.extend(reason for reason in candidate.reasons if reason not in current.reasons)
+            current.replace_existing = current.replace_existing or candidate.replace_existing
+        else:
+            merged.append(candidate)
+    return merged
+
+
+def normalize_audio_for_retry(audio, *, sample_rate: int = 16000):
+    """저음량 회의 구간용 완만한 자동 게인을 적용한다."""
+    import numpy as np
+
+    normalized = np.asarray(audio, dtype=np.float32).copy()
+    frame_size = max(1, int(sample_rate * 0.5))
+    smoothed_gain = 1.0
+    target_rms = 0.06
+    for start in range(0, normalized.size, frame_size):
+        end = min(normalized.size, start + frame_size)
+        frame = normalized[start:end]
+        rms = float(np.sqrt(np.mean(np.square(frame), dtype=np.float64) + 1e-12))
+        desired_gain = 1.0 if rms < 0.001 else min(6.0, max(1.0, target_rms / rms))
+        smoothed_gain = 0.7 * smoothed_gain + 0.3 * desired_gain
+        normalized[start:end] = np.clip(frame * smoothed_gain, -0.98, 0.98)
+    return normalized
+
+
+def annotate_audio_energy(
+    segments: Iterable[SegmentRecord],
+    audio,
+    *,
+    sample_rate: int = 16000,
+) -> None:
+    """재전사 후보가 실제 음성 에너지를 포함하는지 원본 음원에서 측정한다."""
+    import math
+    import numpy as np
+
+    for segment in segments:
+        start = max(0, int(segment.start * sample_rate))
+        end = min(len(audio), max(start + 1, int(segment.end * sample_rate)))
+        clip = audio[start:end]
+        if clip.size == 0:
+            segment.audio_rms_db = -120.0
+            segment.voiced_fraction = 0.0
+            continue
+        rms = float(np.sqrt(np.mean(np.square(clip), dtype=np.float64) + 1e-12))
+        segment.audio_rms_db = 20.0 * math.log10(max(rms, 1e-6))
+        segment.voiced_fraction = float(np.mean(np.abs(clip) > 0.01))
+
+
+def _segments_from_iterator(segments_iter) -> list[SegmentRecord]:
+    records: list[SegmentRecord] = []
+    for raw_segment in segments_iter:
+        text = raw_segment.text.strip()
+        if not text:
+            continue
+        records.append(
+            SegmentRecord(
+                start=float(raw_segment.start),
+                end=float(raw_segment.end),
+                text=text,
+                avg_logprob=float(getattr(raw_segment, "avg_logprob", 0.0)),
+                no_speech_prob=float(getattr(raw_segment, "no_speech_prob", 0.0)),
+                compression_ratio=float(getattr(raw_segment, "compression_ratio", 0.0)),
+            )
+        )
+    return records
+
+
+def _looks_like_generic_hallucination(text: str) -> bool:
+    phrases = (
+        "시청해 주셔서",
+        "시청해주셔서",
+        "구독과 좋아요",
+        "자막 제공",
+        "이곳에 오신 것을 환영",
+        "한국국토정보공사",
+        "이 영상은 제작지원",
+    )
+    return any(phrase in text for phrase in phrases)
+
+
+def _candidate_is_usable(
+    segments: list[SegmentRecord],
+    prompts: Iterable[str],
+    *,
+    require_audio_evidence: bool = False,
+) -> bool:
+    if not segments or sum(len(_normalized_text(item.text)) for item in segments) < 4:
+        return False
+    if any(_looks_like_generic_hallucination(item.text) for item in segments):
+        return False
+    if require_audio_evidence and any(
+        item.audio_rms_db is None
+        or item.voiced_fraction is None
+        or item.audio_rms_db < -40.0
+        or item.voiced_fraction < 0.25
+        for item in segments
+    ):
+        return False
+    if find_quality_issues(segments, prompt_texts=prompts, maximum_segment_seconds=45.0):
+        serious = {"long_segment", "prompt_echo", "repeated_text", "short_fragment_streak"}
+        if any(
+            issue.kind in serious
+            for issue in find_quality_issues(
+                segments, prompt_texts=prompts, maximum_segment_seconds=45.0
+            )
+        ):
+            return False
+    average_logprob = sum(item.avg_logprob for item in segments) / len(segments)
+    average_no_speech = sum(item.no_speech_prob for item in segments) / len(segments)
+    return average_logprob >= -1.1 and average_no_speech <= 0.75
+
+
+def merge_retry_segments(
+    original: Iterable[SegmentRecord],
+    candidates: Iterable[SegmentRecord],
+    attempts: list[RetryAttempt],
+    *,
+    prompt_texts: Iterable[str] = (),
+    require_audio_evidence: bool = False,
+) -> list[SegmentRecord]:
+    """재시도별 품질을 확인하고 채택된 구간만 원 전사에 병합한다."""
+    merged = list(original)
+    candidate_list = list(candidates)
+    for attempt in attempts:
+        selected = [
+            segment
+            for segment in candidate_list
+            if attempt.start <= (segment.start + segment.end) / 2 <= attempt.end
+        ]
+        attempt.candidate_count = len(selected)
+        if require_audio_evidence:
+            selected = [
+                segment
+                for segment in selected
+                if segment.audio_rms_db is not None
+                and segment.voiced_fraction is not None
+                and segment.audio_rms_db >= -40.0
+                and segment.voiced_fraction >= 0.25
+                and not _looks_like_generic_hallucination(segment.text)
+            ]
+        if not _candidate_is_usable(
+            selected,
+            prompt_texts,
+            require_audio_evidence=require_audio_evidence,
+        ):
+            attempt.note = "재전사 결과가 비었거나 품질 기준을 통과하지 못해 원문을 유지했습니다."
+            continue
+
+        existing = [
+            segment
+            for segment in merged
+            if segment.end > attempt.start and segment.start < attempt.end
+        ]
+        if attempt.replace_existing:
+            original_max_duration = max(
+                (segment.end - segment.start for segment in existing), default=0.0
+            )
+            candidate_max_duration = max(
+                (segment.end - segment.start for segment in selected), default=0.0
+            )
+            if len(selected) < 2 and candidate_max_duration >= original_max_duration:
+                attempt.note = "재전사 결과가 기존 이상 구간보다 개선되지 않아 원문을 유지했습니다."
+                continue
+            merged = [
+                segment
+                for segment in merged
+                if segment.end <= attempt.start or segment.start >= attempt.end
+            ]
+        else:
+            selected = [
+                segment
+                for segment in selected
+                if not any(
+                    segment.end > current.start and segment.start < current.end
+                    for current in existing
+                )
+            ]
+            if not selected:
+                attempt.note = "기존 세그먼트와 겹쳐 추가할 새 발화가 없었습니다."
+                continue
+
+        merged.extend(selected)
+        attempt.accepted = True
+        attempt.note = f"재전사 세그먼트 {len(selected)}개를 채택했습니다."
+
+    merged.sort(key=lambda item: (item.start, item.end))
+    deduplicated: list[SegmentRecord] = []
+    for segment in merged:
+        if (
+            deduplicated
+            and segment.start < deduplicated[-1].end
+            and _text_similarity(segment.text, deduplicated[-1].text) >= 0.96
+        ):
+            previous = deduplicated[-1]
+            if segment.avg_logprob > previous.avg_logprob:
+                deduplicated[-1] = segment
+            continue
+        deduplicated.append(segment)
+    return deduplicated
+
+
 def build_summary_template(result: TranscriptionResult) -> str:
     full_text = " ".join(segment.text for segment in result.segments)
     return f"""# 발명자 인터뷰 정리 초안
@@ -206,10 +599,36 @@ def build_review_report(result: TranscriptionResult) -> str:
     lines = [
         "# 전사 검토 구간",
         "",
-        "아래 구간은 전사 세그먼트 사이의 공백이 길어 원본을 다시 들어볼 후보입니다.",
-        "실제 무음일 수도 있으며, 이 목록 자체가 누락을 뜻하지는 않습니다.",
+        "v1.2는 긴 공백뿐 아니라 비정상적으로 긴 세그먼트, 프롬프트 반복, 짧은 파편 연속을 검사합니다.",
+        "자동 재전사 결과가 품질 기준을 통과한 경우에만 최종 전사문에 반영합니다.",
+        "",
+        "## 자동 재전사 결과",
         "",
     ]
+    if result.retry_attempts:
+        for index, attempt in enumerate(result.retry_attempts, start=1):
+            status = "채택" if attempt.accepted else "원문 유지"
+            lines.append(
+                f"{index}. [{format_timestamp(attempt.start)} ~ {format_timestamp(attempt.end)}] "
+                f"**{status}** - {'; '.join(attempt.reasons)}"
+            )
+            lines.append(f"   - {attempt.note}")
+    else:
+        lines.append("자동 재전사가 필요한 이상 구간이 없었습니다.")
+
+    lines.extend(["", "## 1차 전사에서 감지한 품질 문제", ""])
+    if result.quality_issues:
+        for index, issue in enumerate(result.quality_issues, start=1):
+            lines.append(
+                f"{index}. [{format_timestamp(issue.start)} ~ {format_timestamp(issue.end)}] "
+                f"{issue.reason}"
+            )
+            if issue.text:
+                lines.append(f"   - 전사: {issue.text[:160]}")
+    else:
+        lines.append("별도 품질 문제가 감지되지 않았습니다.")
+
+    lines.extend(["", "## 최종 전사에 남은 긴 공백", ""])
     if not result.gaps:
         lines.append("지정한 기준 이상의 긴 공백이 없습니다.")
         return "\n".join(lines) + "\n"
@@ -291,6 +710,12 @@ class TranscriberEngine:
         model_name: str = "large-v3",
         profile_key: str = "high_recall",
         prompt: Optional[str] = None,
+        initial_prompt: Optional[str] = None,
+        hotwords: Optional[str] = None,
+        auto_retry: bool = True,
+        retry_gaps: bool = True,
+        normalize_retry_audio: bool = True,
+        require_retry_audio_evidence: bool = True,
         gap_seconds: float = 15.0,
         include_timestamps: bool = True,
         make_srt: bool = True,
@@ -308,11 +733,15 @@ class TranscriberEngine:
         if "vad_parameters" in options:
             options["vad_parameters"] = dict(options["vad_parameters"])
 
+        # v1.1의 prompt 인자는 하위 호환을 위해 기술용어 목록으로만 취급한다.
+        normalized_hotwords = normalize_hotwords(hotwords if hotwords is not None else prompt)
+        prompt_texts = [text for text in (initial_prompt, normalized_hotwords) if text]
+
         segments_iter, info = self.model.transcribe(
             str(source),
             language="ko",
-            initial_prompt=prompt,
-            hotwords=prompt,
+            initial_prompt=initial_prompt,
+            hotwords=normalized_hotwords,
             beam_size=5,
             word_timestamps=True,
             **options,
@@ -330,14 +759,82 @@ class TranscriberEngine:
                 text=text,
                 avg_logprob=float(raw_segment.avg_logprob),
                 no_speech_prob=float(raw_segment.no_speech_prob),
+                compression_ratio=float(getattr(raw_segment, "compression_ratio", 0.0)),
             )
             segments.append(segment)
             percent = min(100, int(segment.end / max(info.duration, 0.001) * 100))
             if progress_callback and percent >= last_reported + 5:
                 last_reported = percent
                 progress_callback(
-                    percent / 100.0,
-                    f"{format_timestamp(segment.end)} / {format_timestamp(info.duration)} 처리 중",
+                    percent / 125.0,
+                    f"1차 전사 {format_timestamp(segment.end)} / {format_timestamp(info.duration)}",
+                )
+
+        initial_gaps = find_review_gaps(segments, float(info.duration), gap_seconds)
+        quality_issues = find_quality_issues(segments, prompt_texts=prompt_texts)
+        retry_attempts: list[RetryAttempt] = []
+        if auto_retry:
+            retry_attempts = build_retry_attempts(
+                quality_issues,
+                initial_gaps,
+                duration=float(info.duration),
+                retry_gaps=retry_gaps,
+            )
+
+        if retry_attempts:
+            if progress_callback:
+                progress_callback(
+                    0.82,
+                    f"이상 구간 {len(retry_attempts)}개 자동 재전사 준비 중",
+                )
+            original_retry_audio = None
+            retry_audio = str(source)
+            if normalize_retry_audio or require_retry_audio_evidence:
+                from faster_whisper.audio import decode_audio
+
+                original_retry_audio = decode_audio(str(source))
+                retry_audio = (
+                    normalize_audio_for_retry(original_retry_audio)
+                    if normalize_retry_audio
+                    else original_retry_audio
+                )
+            clip_timestamps = [
+                timestamp
+                for attempt in retry_attempts
+                for timestamp in (attempt.start, attempt.end)
+            ]
+            retry_iter, _retry_info = self.model.transcribe(
+                retry_audio,
+                language="ko",
+                initial_prompt=None,
+                hotwords=normalized_hotwords,
+                beam_size=5,
+                word_timestamps=True,
+                vad_filter=False,
+                condition_on_previous_text=False,
+                compression_ratio_threshold=2.4,
+                no_speech_threshold=0.65,
+                log_prob_threshold=-1.0,
+                hallucination_silence_threshold=1.5,
+                repetition_penalty=1.05,
+                no_repeat_ngram_size=3,
+                clip_timestamps=clip_timestamps,
+            )
+            retry_segments = _segments_from_iterator(retry_iter)
+            if original_retry_audio is not None:
+                annotate_audio_energy(retry_segments, original_retry_audio)
+            segments = merge_retry_segments(
+                segments,
+                retry_segments,
+                retry_attempts,
+                prompt_texts=prompt_texts,
+                require_audio_evidence=require_retry_audio_evidence,
+            )
+            if progress_callback:
+                accepted = sum(attempt.accepted for attempt in retry_attempts)
+                progress_callback(
+                    0.95,
+                    f"자동 재전사 완료: {accepted}/{len(retry_attempts)}개 구간 채택",
                 )
 
         result = TranscriptionResult(
@@ -347,6 +844,8 @@ class TranscriberEngine:
             language_probability=float(info.language_probability),
             profile_key=profile_key,
             segments=segments,
+            quality_issues=quality_issues,
+            retry_attempts=retry_attempts,
         )
         result.gaps = find_review_gaps(segments, result.duration, gap_seconds)
         write_outputs(
