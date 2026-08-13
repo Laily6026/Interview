@@ -5,6 +5,7 @@
 
 ## v1.2에서 달라진 점
 
+- Windows 배포 파일명을 `InterviewTranscriber.exe`로 통일하고, 패키징 후 Tkinter 초기화 smoke test를 추가했습니다.
 - 문장형 `initial_prompt`와 명사형 `hotwords`를 분리했습니다. 기본 배경 프롬프트는 비워 두어 프롬프트 문장 자체가 전사되는 문제를 막습니다.
 - 이전 텍스트 조건을 기본적으로 끄고, 잘못 인식한 문장이 다음 디코딩 창으로 전파되는 현상을 줄였습니다.
 - 30초 초과 단일 세그먼트, 프롬프트 복사, 반복 문장, 짧은 파편 연속과 긴 공백을 자동으로 찾습니다.
@@ -72,9 +73,12 @@ python interview_transcriber.py "녹음파일.mp4" --model large-v3 --mode high_
 ```powershell
 python -m pip install -r requirements.txt
 python -m PyInstaller "인터뷰전사기.spec" --noconfirm --clean
+dist\InterviewTranscriber.exe --package-smoke-test
 ```
 
 빌드 설정은 Tcl/Tk 리소스와 런타임 경로를 명시적으로 포함하므로 위 spec 파일을 사용해야 합니다.
+배포 파일명은 브라우저 다운로드와 Windows 보안 경고에서 한글 파일명이 변형되지 않도록
+`InterviewTranscriber.exe`를 사용합니다. 빌드 후 smoke test가 종료 코드 0으로 끝나야 Release에 올릴 수 있습니다.
 
 최초 실행 시 선택한 모델을 내려받기 위해 인터넷 연결이 필요합니다. 모델 다운로드 후에는 오프라인으로 동작합니다.
 

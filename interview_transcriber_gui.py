@@ -345,6 +345,12 @@ class TranscriberApp:
 
 def main() -> None:
     root = tk.Tk()
+    if "--package-smoke-test" in sys.argv:
+        root.withdraw()
+        root.update_idletasks()
+        root.destroy()
+        return
+
     try:
         style = ttk.Style()
         if "vista" in style.theme_names():
