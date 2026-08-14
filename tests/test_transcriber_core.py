@@ -5,11 +5,18 @@ from unittest import TestCase
 
 from transcriber_core import (
     PROFILES,
+    GeminiCandidateSegment,
+    GeminiReviewAttempt,
     QualityIssue,
+    ReviewGap,
     RetryAttempt,
     SegmentRecord,
     TranscriptionResult,
     TranscriberEngine,
+    VertexGeminiReviewer,
+    VertexReviewConfig,
+    _review_clip_bounds,
+    build_review_report,
     build_retry_attempts,
     find_quality_issues,
     find_review_gaps,
@@ -126,6 +133,92 @@ class GapTests(TestCase):
         self.assertEqual([(gap.start, gap.end) for gap in gaps], [(3.0, 20.0), (25.0, 50.0)])
         self.assertEqual(gaps[0].previous_text, "첫 문장")
         self.assertEqual(gaps[0].next_text, "둘째 문장")
+
+    def test_gemini_clip_keeps_full_gap_and_caps_padding(self):
+        gap = ReviewGap(40.0, 100.0)
+        bounds = _review_clip_bounds(gap, duration=200.0, padding_seconds=40.0, max_clip_seconds=90.0)
+        self.assertEqual(bounds, (25.0, 115.0))
+
+    def test_gemini_clip_skips_gap_longer_than_limit(self):
+        gap = ReviewGap(10.0, 140.0)
+        self.assertIsNone(_review_clip_bounds(gap, 200.0, 8.0, 120.0))
+
+
+class GeminiReviewTests(TestCase):
+    @staticmethod
+    def _reviewer_with_response(response):
+        reviewer = VertexGeminiReviewer.__new__(VertexGeminiReviewer)
+        reviewer.config = VertexReviewConfig()
+        reviewer._generate = lambda _payload: response
+        return reviewer
+
+    def test_parses_relative_segments_without_merging(self):
+        response = {
+            "candidates": [{
+                "finishReason": "STOP",
+                "content": {"parts": [{"text": (
+                    '{"segments":[{"start":2.5,"end":4.0,"speaker":"화자 1",'
+                    '"text":"연결관을 확인합니다.","uncertain":false}],"note":"후보"}'
+                )}]},
+            }],
+            "usageMetadata": {"promptTokenCount": 123, "totalTokenCount": 180},
+        }
+        reviewer = self._reviewer_with_response(response)
+        attempt = reviewer.review_gap(
+            ReviewGap(50.0, 60.0),
+            audio_base64="unused",
+            clip_start=45.0,
+            clip_end=70.0,
+        )
+        self.assertEqual(attempt.status, "success")
+        self.assertEqual(attempt.candidates[0].start, 47.5)
+        self.assertEqual(attempt.candidates[0].text, "연결관을 확인합니다.")
+        self.assertEqual(attempt.input_token_count, 123)
+
+    def test_policy_block_is_recorded_without_second_request(self):
+        calls = []
+        reviewer = VertexGeminiReviewer.__new__(VertexGeminiReviewer)
+        reviewer.config = VertexReviewConfig()
+
+        def generate(payload):
+            calls.append(payload)
+            return {"promptFeedback": {"blockReason": "PROHIBITED_CONTENT"}}
+
+        reviewer._generate = generate
+        attempt = reviewer.review_gap(
+            ReviewGap(10.0, 30.0),
+            audio_base64="unused",
+            clip_start=2.0,
+            clip_end=38.0,
+        )
+        self.assertEqual(attempt.status, "blocked")
+        self.assertEqual(len(calls), 1)
+        self.assertIn("자동 재요청하지 않았습니다", attempt.note)
+
+    def test_review_report_marks_candidates_as_review_only(self):
+        result = TranscriptionResult(
+            source=Path("meeting.wav"),
+            duration=100.0,
+            language="ko",
+            language_probability=1.0,
+            profile_key="high_recall",
+            gemini_reviews=[
+                GeminiReviewAttempt(
+                    gap_start=10.0,
+                    gap_end=30.0,
+                    clip_start=2.0,
+                    clip_end=38.0,
+                    status="success",
+                    model="gemini-3.7-flash",
+                    candidates=[
+                        GeminiCandidateSegment(12.0, 15.0, "후보 발화", uncertain=True)
+                    ],
+                )
+            ],
+        )
+        report = build_review_report(result)
+        self.assertIn("자동 반영되지 않습니다", report)
+        self.assertIn("후보 발화 [불확실]", report)
 
 
 class OutputTests(TestCase):

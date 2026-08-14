@@ -30,3 +30,6 @@ venv/
 *.mkv
 *.avi
 *.mov
+
+# 로컬 A/B 검증 자료 (원본 회의 내용과 외부 모델 응답 포함)
+verification/

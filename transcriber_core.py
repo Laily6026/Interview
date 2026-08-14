@@ -4,15 +4,21 @@
 
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
+import io
+import json
+import os
 from pathlib import Path
 import re
 from typing import Callable, Iterable, Optional
+from urllib.parse import quote
+import wave
 
 
 ProgressCallback = Callable[[float, str], None]
-APP_VERSION = "1.2"
+APP_VERSION = "1.3"
 
 
 @dataclass(frozen=True)
@@ -123,6 +129,41 @@ class ReviewGap:
         return self.end - self.start
 
 
+@dataclass(frozen=True)
+class VertexReviewConfig:
+    """사용자가 명시적으로 켠 Vertex AI 선택 검토 설정."""
+
+    service_account_json: Optional[str] = None
+    project_id: Optional[str] = None
+    location: str = "global"
+    model: str = "gemini-3.7-flash"
+    padding_seconds: float = 8.0
+    max_clip_seconds: float = 120.0
+
+
+@dataclass
+class GeminiCandidateSegment:
+    start: float
+    end: float
+    text: str
+    speaker: str = ""
+    uncertain: bool = False
+
+
+@dataclass
+class GeminiReviewAttempt:
+    gap_start: float
+    gap_end: float
+    clip_start: float
+    clip_end: float
+    status: str
+    model: str
+    candidates: list[GeminiCandidateSegment] = field(default_factory=list)
+    note: str = ""
+    input_token_count: Optional[int] = None
+    total_token_count: Optional[int] = None
+
+
 @dataclass
 class TranscriptionResult:
     source: Path
@@ -134,6 +175,7 @@ class TranscriptionResult:
     gaps: list[ReviewGap] = field(default_factory=list)
     quality_issues: list[QualityIssue] = field(default_factory=list)
     retry_attempts: list[RetryAttempt] = field(default_factory=list)
+    gemini_reviews: list[GeminiReviewAttempt] = field(default_factory=list)
     txt_path: Optional[Path] = None
     srt_path: Optional[Path] = None
     md_path: Optional[Path] = None
@@ -199,6 +241,324 @@ def normalize_hotwords(hotwords: Optional[str]) -> Optional[str]:
         return None
     terms = [term.strip() for term in re.split(r"[,;\n]+", hotwords) if term.strip()]
     return ", ".join(dict.fromkeys(terms)) or None
+
+
+def _review_clip_bounds(
+    gap: ReviewGap,
+    duration: float,
+    padding_seconds: float,
+    max_clip_seconds: float,
+) -> Optional[tuple[float, float]]:
+    """공백 전체를 보존하면서 가능한 범위에서 앞뒤 문맥을 붙인다."""
+    if gap.duration <= 0 or gap.duration > max_clip_seconds:
+        return None
+    padding_seconds = max(0.0, padding_seconds)
+    clip_start = max(0.0, gap.start - padding_seconds)
+    clip_end = min(duration, gap.end + padding_seconds)
+    if clip_end - clip_start <= max_clip_seconds:
+        return clip_start, clip_end
+
+    available_padding = max_clip_seconds - gap.duration
+    before = min(padding_seconds, available_padding / 2.0, gap.start)
+    after = min(padding_seconds, available_padding - before, duration - gap.end)
+    remaining = available_padding - before - after
+    if remaining > 0:
+        add_before = min(remaining, gap.start - before)
+        before += add_before
+        remaining -= add_before
+    if remaining > 0:
+        after += min(remaining, duration - gap.end - after)
+    return gap.start - before, gap.end + after
+
+
+def _wav_base64(audio, start: float, end: float, sample_rate: int = 16000) -> str:
+    """faster-whisper의 mono float32 오디오 일부를 메모리 WAV로 변환한다."""
+    import numpy as np
+
+    start_sample = max(0, int(round(start * sample_rate)))
+    end_sample = min(len(audio), int(round(end * sample_rate)))
+    clip = np.asarray(audio[start_sample:end_sample], dtype=np.float32)
+    if clip.size == 0:
+        raise ValueError("Gemini에 보낼 오디오 구간이 비어 있습니다.")
+    pcm = (np.clip(clip, -1.0, 1.0) * 32767.0).astype("<i2")
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(pcm.tobytes())
+    return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+def _json_from_gemini_text(text: str) -> dict:
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        stripped = re.sub(r"^```(?:json)?\s*", "", stripped, flags=re.IGNORECASE)
+        stripped = re.sub(r"\s*```$", "", stripped)
+    value = json.loads(stripped)
+    if not isinstance(value, dict):
+        raise ValueError("Gemini 응답 JSON의 최상위 값이 객체가 아닙니다.")
+    return value
+
+
+class VertexGeminiReviewer:
+    """Vertex AI Gemini에 선택한 오디오 클립을 보내 검토 후보만 받는다."""
+
+    _SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
+
+    def __init__(self, config: VertexReviewConfig):
+        from google.auth.transport.requests import Request as GoogleRequest
+        from google.oauth2 import service_account
+
+        source = config.service_account_json or os.environ.get("VERTEX_SA_JSON")
+        if not source:
+            raise ValueError(
+                "Vertex 서비스 계정 JSON 파일을 선택하거나 VERTEX_SA_JSON 환경 변수를 설정해 주세요."
+            )
+        source_text = str(source).strip()
+        if source_text.startswith("{"):
+            info = json.loads(source_text)
+        else:
+            source_path = Path(source_text).expanduser()
+            if not source_path.is_file():
+                raise FileNotFoundError(
+                    f"Vertex 서비스 계정 JSON을 찾을 수 없습니다: {source_text}"
+                )
+            info = json.loads(source_path.read_text(encoding="utf-8-sig"))
+
+        self.config = config
+        self.project_id = (
+            config.project_id
+            or os.environ.get("VERTEX_PROJECT_ID")
+            or info.get("project_id")
+        )
+        if not self.project_id:
+            raise ValueError("Vertex AI 프로젝트 ID를 확인할 수 없습니다.")
+        self.credentials = service_account.Credentials.from_service_account_info(
+            info,
+            scopes=self._SCOPES,
+        )
+        self._google_request = GoogleRequest()
+
+    def _endpoint(self) -> str:
+        location = (self.config.location or "global").strip()
+        host = (
+            "aiplatform.googleapis.com"
+            if location == "global"
+            else f"{location}-aiplatform.googleapis.com"
+        )
+        project = quote(self.project_id, safe="-._")
+        encoded_location = quote(location, safe="-._")
+        model = quote(self.config.model, safe="-._")
+        return (
+            f"https://{host}/v1/projects/{project}/locations/{encoded_location}/"
+            f"publishers/google/models/{model}:generateContent"
+        )
+
+    def _generate(self, payload: dict) -> dict:
+        import httpx
+
+        if not self.credentials.valid:
+            self.credentials.refresh(self._google_request)
+        with httpx.Client(timeout=180.0) as client:
+            response = client.post(
+                self._endpoint(),
+                headers={"Authorization": f"Bearer {self.credentials.token}"},
+                json=payload,
+            )
+        if response.is_error:
+            try:
+                detail = response.json().get("error", {}).get("message", response.text)
+            except (ValueError, AttributeError):
+                detail = response.text
+            raise RuntimeError(f"Vertex AI HTTP {response.status_code}: {detail[:500]}")
+        return response.json()
+
+    def review_gap(
+        self,
+        gap: ReviewGap,
+        *,
+        audio_base64: str,
+        clip_start: float,
+        clip_end: float,
+        hotwords: Optional[str] = None,
+    ) -> GeminiReviewAttempt:
+        prompt = f"""당신은 한국어 기술 회의 전사 검토자입니다.
+첨부 오디오는 원본의 {format_timestamp(clip_start)}~{format_timestamp(clip_end)} 구간입니다.
+로컬 전사에서 비어 있는 구간은 {format_timestamp(gap.start)}~{format_timestamp(gap.end)}입니다.
+직전 문맥: {gap.previous_text or '(없음)'}
+직후 문맥: {gap.next_text or '(없음)'}
+참고 기술용어: {hotwords or '(없음)'}
+
+실제로 들리는 한국어 발화만 전사하세요. 추측으로 문장을 만들지 말고, 불명확하면 uncertain을 true로 표시하세요.
+start와 end는 첨부 클립 시작을 0초로 한 상대 시간입니다. 화자 구분이 불확실하면 speaker를 빈 문자열로 두세요.
+이 결과는 사람이 검토할 후보이며 기존 전사에 자동 반영되지 않습니다."""
+        schema = {
+            "type": "OBJECT",
+            "properties": {
+                "segments": {
+                    "type": "ARRAY",
+                    "items": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "start": {"type": "NUMBER"},
+                            "end": {"type": "NUMBER"},
+                            "speaker": {"type": "STRING"},
+                            "text": {"type": "STRING"},
+                            "uncertain": {"type": "BOOLEAN"},
+                        },
+                        "required": ["start", "end", "speaker", "text", "uncertain"],
+                    },
+                },
+                "note": {"type": "STRING"},
+            },
+            "required": ["segments", "note"],
+        }
+        payload = {
+            "contents": [{
+                "role": "user",
+                "parts": [
+                    {"text": prompt},
+                    {"inlineData": {"mimeType": "audio/wav", "data": audio_base64}},
+                ],
+            }],
+            "generationConfig": {
+                "temperature": 0,
+                "responseMimeType": "application/json",
+                "responseSchema": schema,
+            },
+        }
+        response = self._generate(payload)
+        usage = response.get("usageMetadata", {})
+        base = dict(
+            gap_start=gap.start,
+            gap_end=gap.end,
+            clip_start=clip_start,
+            clip_end=clip_end,
+            model=self.config.model,
+            input_token_count=usage.get("promptTokenCount"),
+            total_token_count=usage.get("totalTokenCount"),
+        )
+        block_reason = response.get("promptFeedback", {}).get("blockReason")
+        candidates = response.get("candidates") or []
+        finish_reason = candidates[0].get("finishReason") if candidates else None
+        if block_reason or finish_reason in {"PROHIBITED_CONTENT", "SAFETY", "BLOCKLIST"}:
+            reason = block_reason or finish_reason
+            return GeminiReviewAttempt(
+                **base,
+                status="blocked",
+                note=f"Vertex AI 정책에 의해 차단됨: {reason}. 자동 재요청하지 않았습니다.",
+            )
+        if not candidates:
+            return GeminiReviewAttempt(
+                **base,
+                status="error",
+                note="Vertex AI가 후보 응답을 반환하지 않았습니다.",
+            )
+
+        parts = candidates[0].get("content", {}).get("parts", [])
+        response_text = "".join(str(part.get("text", "")) for part in parts)
+        parsed = _json_from_gemini_text(response_text)
+        clip_duration = max(0.0, clip_end - clip_start)
+        candidate_segments: list[GeminiCandidateSegment] = []
+        for raw in parsed.get("segments", []):
+            text = str(raw.get("text", "")).strip()
+            if not text:
+                continue
+            relative_start = max(0.0, min(float(raw.get("start", 0.0)), clip_duration))
+            relative_end = max(relative_start, min(float(raw.get("end", relative_start)), clip_duration))
+            candidate_segments.append(
+                GeminiCandidateSegment(
+                    start=clip_start + relative_start,
+                    end=clip_start + relative_end,
+                    speaker=str(raw.get("speaker", "")).strip(),
+                    text=text,
+                    uncertain=bool(raw.get("uncertain", False)),
+                )
+            )
+        return GeminiReviewAttempt(
+            **base,
+            status="success",
+            candidates=candidate_segments,
+            note=str(parsed.get("note", "")).strip(),
+        )
+
+
+def review_gaps_with_gemini(
+    result: TranscriptionResult,
+    config: VertexReviewConfig,
+    audio,
+    *,
+    hotwords: Optional[str] = None,
+    progress_callback: Optional[ProgressCallback] = None,
+) -> list[GeminiReviewAttempt]:
+    """남은 공백을 검토하되 오류가 로컬 전사 결과 저장을 막지 않게 한다."""
+    if not result.gaps:
+        return []
+    try:
+        reviewer = VertexGeminiReviewer(config)
+    except Exception as exc:
+        return [
+            GeminiReviewAttempt(
+                gap_start=gap.start,
+                gap_end=gap.end,
+                clip_start=gap.start,
+                clip_end=gap.end,
+                status="error",
+                model=config.model,
+                note=f"Gemini 검토를 시작하지 못했습니다: {exc}",
+            )
+            for gap in result.gaps
+        ]
+
+    attempts: list[GeminiReviewAttempt] = []
+    for index, gap in enumerate(result.gaps, start=1):
+        bounds = _review_clip_bounds(
+            gap,
+            result.duration,
+            config.padding_seconds,
+            config.max_clip_seconds,
+        )
+        if bounds is None:
+            attempts.append(
+                GeminiReviewAttempt(
+                    gap_start=gap.start,
+                    gap_end=gap.end,
+                    clip_start=gap.start,
+                    clip_end=gap.end,
+                    status="skipped",
+                    model=config.model,
+                    note=f"공백이 {config.max_clip_seconds:.0f}초를 초과해 외부 전송하지 않았습니다.",
+                )
+            )
+            continue
+        clip_start, clip_end = bounds
+        if progress_callback:
+            progress_callback(
+                0.96 + 0.03 * index / len(result.gaps),
+                f"Gemini 선택 검토 {index}/{len(result.gaps)}",
+            )
+        try:
+            audio_base64 = _wav_base64(audio, clip_start, clip_end)
+            attempt = reviewer.review_gap(
+                gap,
+                audio_base64=audio_base64,
+                clip_start=clip_start,
+                clip_end=clip_end,
+                hotwords=hotwords,
+            )
+        except Exception as exc:
+            attempt = GeminiReviewAttempt(
+                gap_start=gap.start,
+                gap_end=gap.end,
+                clip_start=clip_start,
+                clip_end=clip_end,
+                status="error",
+                model=config.model,
+                note=f"Gemini 검토 오류: {exc}",
+            )
+        attempts.append(attempt)
+    return attempts
 
 
 def _normalized_text(text: str) -> str:
@@ -599,7 +959,7 @@ def build_review_report(result: TranscriptionResult) -> str:
     lines = [
         "# 전사 검토 구간",
         "",
-        "v1.2는 긴 공백뿐 아니라 비정상적으로 긴 세그먼트, 프롬프트 반복, 짧은 파편 연속을 검사합니다.",
+        "v1.3은 긴 공백뿐 아니라 비정상적으로 긴 세그먼트, 프롬프트 반복, 짧은 파편 연속을 검사합니다.",
         "자동 재전사 결과가 품질 기준을 통과한 경우에만 최종 전사문에 반영합니다.",
         "",
         "## 자동 재전사 결과",
@@ -631,17 +991,55 @@ def build_review_report(result: TranscriptionResult) -> str:
     lines.extend(["", "## 최종 전사에 남은 긴 공백", ""])
     if not result.gaps:
         lines.append("지정한 기준 이상의 긴 공백이 없습니다.")
-        return "\n".join(lines) + "\n"
+    else:
+        for index, gap in enumerate(result.gaps, start=1):
+            lines.append(
+                f"{index}. [{format_timestamp(gap.start)} ~ {format_timestamp(gap.end)}] "
+                f"({gap.duration:.1f}초)"
+            )
+            if gap.previous_text:
+                lines.append(f"   - 직전: {gap.previous_text[-100:]}")
+            if gap.next_text:
+                lines.append(f"   - 직후: {gap.next_text[:100]}")
 
-    for index, gap in enumerate(result.gaps, start=1):
-        lines.append(
-            f"{index}. [{format_timestamp(gap.start)} ~ {format_timestamp(gap.end)}] "
-            f"({gap.duration:.1f}초)"
-        )
-        if gap.previous_text:
-            lines.append(f"   - 직전: {gap.previous_text[-100:]}")
-        if gap.next_text:
-            lines.append(f"   - 직후: {gap.next_text[:100]}")
+    lines.extend(["", "## Gemini 3.7 Flash 선택 검토 후보", ""])
+    lines.append("이 절의 후보는 최종 전사문에 자동 반영되지 않습니다. 반드시 원음을 듣고 확인하세요.")
+    if not result.gemini_reviews:
+        lines.append("Gemini 외부 검토를 사용하지 않았거나 검토할 긴 공백이 없었습니다.")
+    else:
+        lines.append("사용자가 선택한 공백 오디오 클립과 앞뒤 문맥만 Google Vertex AI로 전송했습니다.")
+        status_labels = {
+            "success": "후보 생성",
+            "blocked": "정책 차단",
+            "error": "오류",
+            "skipped": "전송 안 함",
+        }
+        for index, attempt in enumerate(result.gemini_reviews, start=1):
+            status = status_labels.get(attempt.status, attempt.status)
+            lines.append(
+                f"{index}. [{format_timestamp(attempt.gap_start)} ~ {format_timestamp(attempt.gap_end)}] "
+                f"**{status}** ({attempt.model})"
+            )
+            lines.append(
+                f"   - 전송 구간: {format_timestamp(attempt.clip_start)} ~ "
+                f"{format_timestamp(attempt.clip_end)}"
+            )
+            if attempt.note:
+                lines.append(f"   - 메모: {attempt.note}")
+            if attempt.input_token_count is not None:
+                lines.append(
+                    f"   - 토큰: 입력 {attempt.input_token_count:,}, "
+                    f"전체 {attempt.total_token_count or 0:,}"
+                )
+            if not attempt.candidates and attempt.status == "success":
+                lines.append("   - 들리는 발화 후보 없음")
+            for candidate in attempt.candidates:
+                speaker = f" {candidate.speaker}:" if candidate.speaker else ""
+                uncertain = " [불확실]" if candidate.uncertain else ""
+                lines.append(
+                    f"   - [{format_timestamp(candidate.start)} ~ "
+                    f"{format_timestamp(candidate.end)}]{speaker} {candidate.text}{uncertain}"
+                )
     return "\n".join(lines) + "\n"
 
 
@@ -720,6 +1118,7 @@ class TranscriberEngine:
         include_timestamps: bool = True,
         make_srt: bool = True,
         output_dir: Optional[Path] = None,
+        vertex_review: Optional[VertexReviewConfig] = None,
         progress_callback: Optional[ProgressCallback] = None,
     ) -> TranscriptionResult:
         if profile_key not in PROFILES:
@@ -773,6 +1172,7 @@ class TranscriberEngine:
         initial_gaps = find_review_gaps(segments, float(info.duration), gap_seconds)
         quality_issues = find_quality_issues(segments, prompt_texts=prompt_texts)
         retry_attempts: list[RetryAttempt] = []
+        original_retry_audio = None
         if auto_retry:
             retry_attempts = build_retry_attempts(
                 quality_issues,
@@ -787,7 +1187,6 @@ class TranscriberEngine:
                     0.82,
                     f"이상 구간 {len(retry_attempts)}개 자동 재전사 준비 중",
                 )
-            original_retry_audio = None
             retry_audio = str(source)
             if normalize_retry_audio or require_retry_audio_evidence:
                 from faster_whisper.audio import decode_audio
@@ -848,6 +1247,32 @@ class TranscriberEngine:
             retry_attempts=retry_attempts,
         )
         result.gaps = find_review_gaps(segments, result.duration, gap_seconds)
+        if vertex_review is not None and result.gaps:
+            try:
+                if original_retry_audio is None:
+                    from faster_whisper.audio import decode_audio
+
+                    original_retry_audio = decode_audio(str(source))
+                result.gemini_reviews = review_gaps_with_gemini(
+                    result,
+                    vertex_review,
+                    original_retry_audio,
+                    hotwords=normalized_hotwords,
+                    progress_callback=progress_callback,
+                )
+            except Exception as exc:
+                result.gemini_reviews = [
+                    GeminiReviewAttempt(
+                        gap_start=gap.start,
+                        gap_end=gap.end,
+                        clip_start=gap.start,
+                        clip_end=gap.end,
+                        status="error",
+                        model=vertex_review.model,
+                        note=f"Gemini 검토 준비 오류: {exc}",
+                    )
+                    for gap in result.gaps
+                ]
         write_outputs(
             result,
             include_timestamps=include_timestamps,

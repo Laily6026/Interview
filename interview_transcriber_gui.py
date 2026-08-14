@@ -15,7 +15,13 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 from typing import Iterable
 
-from transcriber_core import APP_VERSION, PROFILES, TranscriberEngine, format_timestamp
+from transcriber_core import (
+    APP_VERSION,
+    PROFILES,
+    TranscriberEngine,
+    VertexReviewConfig,
+    format_timestamp,
+)
 
 
 AUDIO_EXTENSIONS = {
@@ -30,9 +36,9 @@ PROFILE_LABEL_TO_KEY = {profile.label: key for key, profile in PROFILES.items()}
 class TranscriberApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title(f"발명자 인터뷰 전사기 v{APP_VERSION} — 로컬 처리")
-        self.root.geometry("840x800")
-        self.root.minsize(740, 680)
+        self.root.title(f"발명자 인터뷰 전사기 v{APP_VERSION}")
+        self.root.geometry("900x940")
+        self.root.minsize(800, 760)
 
         self.files: list[Path] = []
         self.engine = TranscriberEngine()
@@ -138,6 +144,59 @@ class TranscriberApp:
         self.initial_prompt_entry = tk.Text(prompt_row, height=2, wrap="word")
         self.initial_prompt_entry.pack(fill="x", pady=(2, 0))
 
+        gemini_frame = ttk.LabelFrame(
+            self.root,
+            text="3. Gemini 선택 검토 (외부 Vertex AI, 선택 사항)",
+        )
+        gemini_frame.pack(fill="x", **pad)
+        self.gemini_review_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            gemini_frame,
+            text="최종 긴 공백을 Gemini 3.7 Flash로 검토",
+            variable=self.gemini_review_var,
+        ).pack(anchor="w", padx=8, pady=(6, 2))
+        ttk.Label(
+            gemini_frame,
+            text=(
+                "체크하면 공백 오디오와 앞뒤 전사문이 Google Vertex AI로 전송됩니다. "
+                "후보는 검토 파일에만 기록되며 자동 반영되지 않습니다."
+            ),
+            foreground="#9A4D00",
+            wraplength=840,
+        ).pack(fill="x", padx=8, pady=(0, 4))
+
+        credential_row = ttk.Frame(gemini_frame)
+        credential_row.pack(fill="x", padx=8, pady=3)
+        ttk.Label(credential_row, text="서비스 계정 JSON:").pack(side="left")
+        self.vertex_service_account_var = tk.StringVar()
+        ttk.Entry(
+            credential_row,
+            textvariable=self.vertex_service_account_var,
+        ).pack(side="left", fill="x", expand=True, padx=6)
+        ttk.Button(
+            credential_row,
+            text="찾아보기",
+            command=self.select_vertex_service_account,
+        ).pack(side="left")
+
+        vertex_row = ttk.Frame(gemini_frame)
+        vertex_row.pack(fill="x", padx=8, pady=(3, 7))
+        ttk.Label(vertex_row, text="프로젝트 ID(선택):").pack(side="left")
+        self.vertex_project_var = tk.StringVar()
+        ttk.Entry(vertex_row, textvariable=self.vertex_project_var, width=20).pack(
+            side="left", padx=(4, 12)
+        )
+        ttk.Label(vertex_row, text="위치:").pack(side="left")
+        self.vertex_location_var = tk.StringVar(value="global")
+        ttk.Entry(vertex_row, textvariable=self.vertex_location_var, width=10).pack(
+            side="left", padx=(4, 12)
+        )
+        ttk.Label(vertex_row, text="모델:").pack(side="left")
+        self.gemini_model_var = tk.StringVar(value="gemini-3.7-flash")
+        ttk.Entry(vertex_row, textvariable=self.gemini_model_var, width=20).pack(
+            side="left", padx=(4, 0)
+        )
+
         run_frame = ttk.Frame(self.root)
         run_frame.pack(fill="x", **pad)
         self.run_button = ttk.Button(run_frame, text="▶ 전사 시작", command=self.start_transcription)
@@ -152,9 +211,12 @@ class TranscriberApp:
         ttk.Button(bottom_frame, text="결과 폴더 열기", command=self.open_output_folder).pack(side="left")
         ttk.Button(bottom_frame, text="전사문 열기", command=self.open_txt).pack(side="left", padx=6)
         ttk.Button(bottom_frame, text="검토 구간 열기", command=self.open_review).pack(side="left")
-        ttk.Label(bottom_frame, text="모든 처리는 PC에서 로컬로 수행됩니다.").pack(side="right")
+        ttk.Label(
+            bottom_frame,
+            text="기본은 로컬 처리 · Gemini 사용 시 선택 구간만 외부 전송",
+        ).pack(side="right")
 
-        log_frame = ttk.LabelFrame(self.root, text="3. 진행 상황")
+        log_frame = ttk.LabelFrame(self.root, text="4. 진행 상황")
         log_frame.pack(fill="both", expand=True, **pad)
         self.log_box = scrolledtext.ScrolledText(
             log_frame,
@@ -190,6 +252,14 @@ class TranscriberApp:
             messagebox.showwarning("알림", "폴더에 지원하는 오디오·비디오 파일이 없습니다.")
             return
         self._add_files(found)
+
+    def select_vertex_service_account(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Vertex 서비스 계정 JSON 선택",
+            filetypes=[("JSON 파일", "*.json"), ("모든 파일", "*.*")],
+        )
+        if path:
+            self.vertex_service_account_var.set(path)
 
     def _add_files(self, paths: Iterable[Path]) -> None:
         for path in paths:
@@ -239,6 +309,28 @@ class TranscriberApp:
             messagebox.showwarning("알림", "검토 공백 기준은 0보다 큰 숫자로 입력해 주세요.")
             return
 
+        vertex_review = None
+        if self.gemini_review_var.get():
+            service_account = self.vertex_service_account_var.get().strip() or None
+            if not service_account and not os.environ.get("VERTEX_SA_JSON"):
+                messagebox.showwarning(
+                    "Vertex AI 설정 필요",
+                    "서비스 계정 JSON 파일을 선택해 주세요.",
+                )
+                return
+            if not messagebox.askyesno(
+                "외부 전송 확인",
+                "남은 긴 공백의 오디오 클립과 앞뒤 전사문을 Google Vertex AI로 전송할까요?\n\n"
+                "Gemini 후보는 최종 전사문에 자동 반영되지 않습니다.",
+            ):
+                return
+            vertex_review = VertexReviewConfig(
+                service_account_json=service_account,
+                project_id=self.vertex_project_var.get().strip() or None,
+                location=self.vertex_location_var.get().strip() or "global",
+                model=self.gemini_model_var.get().strip() or "gemini-3.7-flash",
+            )
+
         self.running = True
         self.run_button.configure(state="disabled")
         self.progress["value"] = 0
@@ -253,6 +345,7 @@ class TranscriberApp:
             self.normalize_retry_var.get(),
             self.timestamps_var.get(),
             self.srt_var.get(),
+            vertex_review,
             list(self.files),
         )
         threading.Thread(target=self._worker, args=worker_args, daemon=True).start()
@@ -268,6 +361,7 @@ class TranscriberApp:
         normalize_retry_audio: bool,
         include_timestamps: bool,
         make_srt: bool,
+        vertex_review: VertexReviewConfig | None,
         files: list[Path],
     ) -> None:
         try:
@@ -276,6 +370,10 @@ class TranscriberApp:
             self._queue_log(f"모델: {model_name}")
             self._queue_log(f"전사 모드: {PROFILES[profile_key].label}")
             self._queue_log(f"이상 구간 자동 재전사: {'사용' if auto_retry else '사용 안 함'}")
+            self._queue_log(
+                "Gemini 선택 검토: "
+                + (f"사용 ({vertex_review.model})" if vertex_review else "사용 안 함")
+            )
             for file_index, audio_path in enumerate(files, start=1):
                 self._queue_log(f"\n[{file_index}/{len(files)}] 전사 시작: {audio_path.name}")
                 result = self.engine.transcribe(
@@ -289,6 +387,7 @@ class TranscriberApp:
                     gap_seconds=gap_seconds,
                     include_timestamps=include_timestamps,
                     make_srt=make_srt,
+                    vertex_review=vertex_review,
                     progress_callback=self._queue_progress,
                 )
                 self.last_output_dir = audio_path.parent
@@ -301,11 +400,18 @@ class TranscriberApp:
                 )
                 self._queue_log(f"전사문: {result.txt_path.name}")
                 self._queue_log(f"검토 구간: {result.review_path.name}")
+                if result.gemini_reviews:
+                    succeeded = sum(item.status == "success" for item in result.gemini_reviews)
+                    blocked = sum(item.status == "blocked" for item in result.gemini_reviews)
+                    self._queue_log(
+                        f"Gemini 검토: 후보 응답 {succeeded}개, 정책 차단 {blocked}개, "
+                        f"전체 {len(result.gemini_reviews)}개"
+                    )
 
             self._queue_log(f"\n모든 작업 완료 ({time.time() - started:.0f}초)")
             self._queue_progress(1.0, "완료")
         except ImportError:
-            self._queue_log("오류: faster-whisper가 설치되어 있지 않습니다.")
+            self._queue_log("오류: 필요한 Python 패키지가 설치되어 있지 않습니다.")
             self._queue_log("명령 프롬프트에서: pip install -r requirements.txt")
         except Exception as exc:
             self._queue_log(f"오류 발생: {exc}")
@@ -346,7 +452,12 @@ class TranscriberApp:
 def main() -> None:
     root = tk.Tk()
     if "--package-smoke-test" in sys.argv:
+        import httpx  # noqa: F401 - 패키징된 선택 검토 의존성 확인
+        from google.auth.transport.requests import Request as GoogleRequest  # noqa: F401
+        from google.oauth2 import service_account  # noqa: F401
+
         root.withdraw()
+        TranscriberApp(root)
         root.update_idletasks()
         root.destroy()
         return

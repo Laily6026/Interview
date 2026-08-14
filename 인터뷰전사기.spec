@@ -9,6 +9,12 @@ binaries = []
 hiddenimports = []
 tmp_ret = collect_all('faster_whisper')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+hiddenimports += [
+    'google.auth.transport.requests',
+    'google.oauth2.service_account',
+    'httpx',
+    'requests',
+]
 
 python_root = Path(sys.base_prefix)
 datas += [

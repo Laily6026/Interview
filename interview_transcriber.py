@@ -8,11 +8,11 @@ import argparse
 import sys
 from pathlib import Path
 
-from transcriber_core import APP_VERSION, PROFILES, TranscriberEngine
+from transcriber_core import APP_VERSION, PROFILES, TranscriberEngine, VertexReviewConfig
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="faster-whisper 기반 한국어 인터뷰 전사기 v1.2")
+    parser = argparse.ArgumentParser(description="faster-whisper 기반 한국어 인터뷰 전사기 v1.3")
     parser.add_argument("--version", action="version", version=f"%(prog)s {APP_VERSION}")
     parser.add_argument("files", nargs="+", type=Path, help="전사할 오디오 또는 동영상 파일")
     parser.add_argument("--model", default="large-v3", help="Whisper 모델 이름")
@@ -44,12 +44,40 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=Path, default=None, help="결과를 저장할 별도 폴더")
     parser.add_argument("--no-timestamps", action="store_true", help="TXT 타임스탬프 생략")
     parser.add_argument("--no-srt", action="store_true", help="SRT 자막을 만들지 않음")
+    parser.add_argument(
+        "--gemini-review",
+        action="store_true",
+        help="남은 긴 공백만 Vertex AI Gemini로 선택 검토 (외부 전송, 자동 병합 안 함)",
+    )
+    parser.add_argument(
+        "--vertex-service-account",
+        default=None,
+        help="Vertex 서비스 계정 JSON 파일 (또는 VERTEX_SA_JSON 환경 변수)",
+    )
+    parser.add_argument("--vertex-project-id", default=None, help="Vertex AI 프로젝트 ID")
+    parser.add_argument("--vertex-location", default="global", help="Vertex AI 위치")
+    parser.add_argument("--gemini-model", default="gemini-3.7-flash", help="Gemini 모델 이름")
+    parser.add_argument(
+        "--gemini-max-clip-seconds",
+        type=float,
+        default=120.0,
+        help="외부 전송할 공백 클립의 최대 길이",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     engine = TranscriberEngine()
+    vertex_review = None
+    if args.gemini_review:
+        vertex_review = VertexReviewConfig(
+            service_account_json=args.vertex_service_account,
+            project_id=args.vertex_project_id,
+            location=args.vertex_location,
+            model=args.gemini_model,
+            max_clip_seconds=args.gemini_max_clip_seconds,
+        )
 
     def show_progress(progress: float, message: str) -> None:
         print(f"[{progress * 100:5.1f}%] {message}", flush=True)
@@ -72,6 +100,7 @@ def main(argv: list[str] | None = None) -> int:
                 include_timestamps=not args.no_timestamps,
                 make_srt=not args.no_srt,
                 output_dir=args.output_dir,
+                vertex_review=vertex_review,
                 progress_callback=show_progress,
             )
             accepted_retries = sum(attempt.accepted for attempt in result.retry_attempts)
@@ -81,6 +110,9 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(f"전사문: {result.txt_path}")
             print(f"검토 구간: {result.review_path}")
+            if result.gemini_reviews:
+                succeeded = sum(item.status == "success" for item in result.gemini_reviews)
+                print(f"Gemini 선택 검토: {succeeded}/{len(result.gemini_reviews)}개 후보 응답")
         except Exception as exc:
             failed = True
             print(f"오류: {source}: {exc}", file=sys.stderr)

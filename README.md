@@ -1,62 +1,94 @@
-# 발명자 인터뷰 전사기 v1.2
+# 발명자 인터뷰 전사기 v1.3
 
-발명자 인터뷰 녹음·영상(mp3, m4a, mp4 등)을 한국어 텍스트로 변환하는 로컬 프로그램입니다.
-`faster-whisper`를 사용하며 음성 파일은 외부 서버로 전송되지 않습니다.
+발명자 인터뷰 녹음·영상(mp3, m4a, mp4 등)을 한국어 텍스트로 변환하는 Windows용 전사 도구입니다. 기본 전사는 `faster-whisper`와 `large-v3`를 사용해 PC에서 로컬로 처리합니다.
 
-## v1.2에서 달라진 점
+## v1.3 주요 변경
 
-- Windows 배포 파일명을 `InterviewTranscriber.exe`로 통일하고, 패키징 후 Tkinter 초기화 smoke test를 추가했습니다.
-- 문장형 `initial_prompt`와 명사형 `hotwords`를 분리했습니다. 기본 배경 프롬프트는 비워 두어 프롬프트 문장 자체가 전사되는 문제를 막습니다.
-- 이전 텍스트 조건을 기본적으로 끄고, 잘못 인식한 문장이 다음 디코딩 창으로 전파되는 현상을 줄였습니다.
-- 30초 초과 단일 세그먼트, 프롬프트 복사, 반복 문장, 짧은 파편 연속과 긴 공백을 자동으로 찾습니다.
-- 이상 구간만 VAD를 끄고 문맥을 초기화해 재전사하며, 품질 기준을 통과한 결과만 병합합니다.
-- 재전사할 때 저음량 음성을 자동 보정할 수 있습니다.
-- `*_전사_검토구간.md`에 감지 사유, 재전사 채택 여부와 최종 공백을 함께 기록합니다.
-- TXT·SRT·Markdown 결과는 Windows 메모장에서도 열리는 UTF-8 BOM으로 저장합니다.
+- 최종 전사에 남은 긴 공백만 Vertex AI의 `gemini-3.7-flash`로 선택 검토할 수 있습니다.
+- Gemini 기능은 기본적으로 꺼져 있으며, GUI에서 외부 전송 확인을 거쳐야 실행됩니다.
+- 공백 전체와 최대 8초의 앞뒤 문맥만 메모리 WAV로 전송합니다. 전체 원본 파일을 업로드하거나 원격 파일로 보관하지 않습니다.
+- Gemini 응답은 `*_전사_검토구간.md`에 후보로만 기록하며 최종 전사문에 자동 병합하지 않습니다.
+- 정책 차단이 발생한 구간은 다른 프롬프트로 우회하거나 자동 재요청하지 않습니다.
+- 서비스 계정 키는 실행 파일에 포함하거나 저장하지 않습니다.
 
-## 전사 모드
+훌루테크 회의 녹음 A/B 시험에서는 Gemini가 일부 기술용어와 Whisper의 누락 구간을 보완했지만, 일부 구간은 정책 차단되었고 불명확한 음성을 확신하는 경우도 있었습니다. 따라서 v1.3은 Gemini를 전체 전사의 대체 모델이 아닌 사람 검토용 선택 후보 생성기로 사용합니다.
+
+## 전사 방식
 
 | 모드 | 동작 | 권장 상황 |
 |---|---|---|
-| 누락 최소화 (기본) | 민감한 VAD와 앞뒤 1초 여백 사용 | 회의·인터뷰, 작은 목소리, 누락이 문제인 경우 |
-| 균형 | 낮은 임계값과 넉넉한 여백으로 VAD 사용 | 무음이 매우 긴 녹음 |
-| 빠르게 | 명확한 음성만 선별 | 깨끗한 단일 화자 녹음, 초벌 확인 |
+| 누락 최소화 (기본) | 민감한 VAD와 앞뒤 1초 여백 | 회의·인터뷰, 작은 목소리 |
+| 균형 | 보수적인 VAD | 무음이 매우 긴 녹음 |
+| 빠르게 | 명확한 음성 위주 | 짧고 깨끗한 녹음 |
 
-VAD는 음성 구간 감지(Voice Activity Detection)입니다. 임계값이 너무 높으면 작은 음성이 모델에 전달되기 전에 빠지고, 완전히 끄면 긴 무음에서 반복 문장이 생길 수 있습니다. 기본 모드는 이 영상으로 확인한 낮은 임계값과 넓은 여백을 사용합니다.
+1차 전사 후 비정상적으로 긴 세그먼트, 프롬프트 반복, 짧은 파편 연속, 긴 공백을 검사합니다. 이상 구간만 VAD를 끄고 재전사한 뒤 품질 기준과 오디오 에너지 기준을 통과한 후보만 로컬 전사문에 병합합니다.
 
-## GUI로 실행
+## 설치 및 GUI 실행
 
 ```powershell
 python -m pip install -r requirements.txt
 python interview_transcriber_gui.py
 ```
 
-1. 파일 또는 폴더를 선택합니다.
-2. 정확도가 중요하면 `large-v3`와 `누락 최소화 (권장)`를 사용합니다.
-3. 사건별 기술용어·고유명사는 `hotwords` 입력란에 쉼표로 구분해 넣습니다.
-4. 문장형 배경 설명이 꼭 필요한 경우에만 `initial prompt`를 입력합니다.
-5. `이상 구간 자동 재전사`와 `재전사 시 저음량 보정`을 켜 둡니다.
-6. 전사가 끝나면 전사문과 함께 검토 구간 파일을 확인합니다.
+1. 음성·영상 파일 또는 폴더를 선택합니다.
+2. 보통 `large-v3`와 `누락 최소화 (권장)`을 사용합니다.
+3. 기술용어와 고유명사를 쉼표로 구분해 hotwords에 입력합니다.
+4. 필요한 경우에만 짧은 배경 설명을 initial prompt에 입력합니다.
+5. Gemini 검토가 필요하면 아래 Vertex AI 설정을 완료한 뒤 체크합니다.
+6. 완료 후 전사문과 검토 구간 파일을 함께 확인합니다.
 
-결과는 원본과 같은 폴더에 생성됩니다.
+## Gemini 선택 검토 설정
 
-- `파일명_전사.txt`: 타임스탬프 포함 전사문
-- `파일명_자막.srt`: 원본 대조용 자막
-- `파일명_정리초안.md`: 정리 템플릿과 전체 전사문
-- `파일명_전사_검토구간.md`: 장시간 공백 청취 검토 목록
+Vertex AI API 사용 권한이 있는 Google Cloud 서비스 계정 JSON이 필요합니다. GUI의 `서비스 계정 JSON`에서 파일을 선택합니다. 프로젝트 ID는 JSON의 `project_id`를 기본으로 사용하며 필요할 때만 직접 입력합니다.
 
-## CLI로 실행
+환경 변수로 설정할 수도 있습니다.
 
 ```powershell
-python interview_transcriber.py "녹음파일.mp4" --model large-v3 --mode high_recall
+$env:VERTEX_SA_JSON = "C:\secure\vertex-service-account.json"
+$env:VERTEX_PROJECT_ID = "my-project-id"  # 선택 사항
+```
+
+주의 사항:
+
+- 체크하면 남은 긴 공백의 오디오 클립과 직전·직후 전사문이 Google Vertex AI로 전송됩니다.
+- 구간당 전송 길이는 기본 최대 120초입니다. 더 긴 공백은 전송하지 않고 검토 보고서에 표시합니다.
+- 결과에는 오류·정책 차단·토큰 사용량과 후보 문장이 기록됩니다.
+- API 비용, 데이터 처리 위치, 조직의 보안 정책을 확인한 후 사용하세요.
+- 서비스 계정 JSON과 회의 원본·전사 결과는 저장소에 커밋하지 마세요.
+
+## 생성 파일
+
+- `파일명_전사.txt`: 타임스탬프 포함 전사문
+- `파일명_자막.srt`: 영상 대조용 자막
+- `파일명_정리초안.md`: 인터뷰 정리 템플릿과 전체 전사문
+- `파일명_전사_검토구간.md`: 자동 재전사 판단, 남은 공백, Gemini 검토 후보
+
+모든 결과는 Windows 메모장에서 한글이 안정적으로 열리도록 UTF-8 BOM으로 저장됩니다.
+
+## CLI
+
+로컬 전사:
+
+```powershell
+python interview_transcriber.py "회의.mp4" --model large-v3 --mode high_recall
+```
+
+Gemini 선택 검토 포함:
+
+```powershell
+python interview_transcriber.py "회의.mp4" `
+  --gemini-review `
+  --vertex-service-account "C:\secure\vertex-service-account.json" `
+  --vertex-location global `
+  --gemini-model gemini-3.7-flash
 ```
 
 주요 옵션:
 
 ```text
 --mode high_recall|balanced|fast
---hotwords "LOT, AMR, HMI, 국소탐색"
---initial-prompt "필요한 경우에만 쓰는 짧은 배경 설명"
+--hotwords "LOT, AMR, HMI, 연결관"
+--initial-prompt "필요한 경우에만 사용하는 짧은 회의 배경"
 --gap-seconds 15
 --output-dir "결과폴더"
 --no-auto-retry
@@ -64,32 +96,19 @@ python interview_transcriber.py "녹음파일.mp4" --model large-v3 --mode high_
 --no-normalize-retry
 --no-timestamps
 --no-srt
+--gemini-review
+--vertex-service-account PATH
+--vertex-project-id PROJECT_ID
+--vertex-location global
+--gemini-model gemini-3.7-flash
+--gemini-max-clip-seconds 120
 ```
 
-이전 버전의 `--prompt` 옵션은 호환을 위해 남아 있으며 `--hotwords`와 같은 의미로 처리됩니다.
-
-## `.exe` 빌드
+## Windows EXE 빌드와 검증
 
 ```powershell
-python -m pip install -r requirements.txt
 python -m PyInstaller "인터뷰전사기.spec" --noconfirm --clean
 dist\InterviewTranscriber.exe --package-smoke-test
 ```
 
-빌드 설정은 Tcl/Tk 리소스와 런타임 경로를 명시적으로 포함하므로 위 spec 파일을 사용해야 합니다.
-배포 파일명은 브라우저 다운로드와 Windows 보안 경고에서 한글 파일명이 변형되지 않도록
-`InterviewTranscriber.exe`를 사용합니다. 빌드 후 smoke test가 종료 코드 0으로 끝나야 Release에 올릴 수 있습니다.
-
-최초 실행 시 선택한 모델을 내려받기 위해 인터넷 연결이 필요합니다. 모델 다운로드 후에는 오프라인으로 동작합니다.
-
-## 정확도를 높이는 팁
-
-- `large-v3`만 선택하는 것보다 전사 모드가 중요합니다. 누락이 걱정되면 `누락 최소화`를 사용하세요.
-- 기술용어에는 문장이 아니라 실제 발화에 나오는 표기와 약어를 쉼표로 넣으세요.
-- 자동 재전사는 보수적으로 결과를 채택합니다. 검토 파일에 `원문 유지`로 표시된 구간은 원본을 들어 확인하세요.
-- 매우 긴 녹음에서 저음량 보정을 사용하면 음원을 메모리에 한 번 디코딩하므로 추가 메모리와 시간이 필요합니다.
-- 겹쳐 말한 부분, 매우 작은 원격 화자, 잘린 마이크 음성은 모델만 바꿔도 완전히 복원되지 않을 수 있습니다.
-
-## 보안 주의
-
-전사 결과에는 공개 전 발명 내용이 포함될 수 있습니다. 오디오와 결과물은 `.gitignore`로 차단되어 있으므로 저장소에 강제로 커밋하지 마세요.
+배포 자산 이름은 브라우저 다운로드 시 한글 파일명이 변형되지 않도록 `InterviewTranscriber.exe`를 사용합니다. 최초 로컬 전사 시 Whisper 모델 다운로드를 위해 인터넷 연결이 필요하고, 이후에는 Gemini 선택 검토를 사용하지 않는 한 오프라인으로 동작합니다.
